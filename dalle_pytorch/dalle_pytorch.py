@@ -52,7 +52,6 @@ class ResBlock(nn.Module):
     def __init__(self, chan):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(chan, chan, 3, padding = 1),
             nn.ReLU(),
             nn.Conv2d(chan, chan, 3, padding = 1),
             nn.ReLU(),
@@ -69,7 +68,7 @@ class DiscreteVAE(nn.Module):
         num_tokens = 512,
         codebook_dim = 512,
         num_layers = 3,
-        num_resnet_blocks = 0,
+        num_res_blocks = 0,
         hidden_dim = 64,
         channels = 3,
         temperature = 0.9,
@@ -78,7 +77,7 @@ class DiscreteVAE(nn.Module):
         super().__init__()
         assert log2(image_size).is_integer(), 'image size must be a power of 2'
         assert num_layers >= 1, 'number of layers must be greater than or equal to 1'
-        has_resblocks = num_resnet_blocks > 0
+        has_resblocks = num_res_blocks > 0
 
         self.image_size = image_size
         self.num_tokens = num_tokens
@@ -89,39 +88,51 @@ class DiscreteVAE(nn.Module):
 
         hdim = hidden_dim
 
+        # Set the dimension of each conv layer
         enc_chans = [hidden_dim] * num_layers
         dec_chans = list(reversed(enc_chans))
 
+        # Set the input / output channels
         enc_chans = [channels, *enc_chans]
-
-        dec_init_chan = codebook_dim if not has_resblocks else dec_chans[0]
-        dec_chans = [dec_init_chan, *dec_chans]
+        dec_chans = [*dec_chans, channels]
 
         enc_chans_io, dec_chans_io = map(lambda t: list(zip(t[:-1], t[1:])), (enc_chans, dec_chans))
 
         enc_layers = []
         dec_layers = []
 
-        for (enc_in, enc_out), (dec_in, dec_out) in zip(enc_chans_io, dec_chans_io):
-            enc_layers.append(nn.Sequential(nn.Conv2d(enc_in, enc_out, 4, stride = 2, padding = 1), nn.ReLU()))
-            dec_layers.append(nn.Sequential(nn.ConvTranspose2d(dec_in, dec_out, 4, stride = 2, padding = 1), nn.ReLU()))
+        # Add 2-strided convs
+        for i, ((enc_in, enc_out), (dec_in, dec_out)) in enumerate(zip(enc_chans_io, dec_chans_io)):
+            enc_layers.append(nn.Conv2d(enc_in, enc_out, 4, stride = 2, padding = 1))
+            enc_layers.append(nn.ReLU())
+            dec_layers.append(nn.ConvTranspose2d(dec_in, dec_out, 4, stride = 2, padding = 1))
+            if i != len(dec_chans_io) - 1:
+                dec_layers.append(nn.ReLU())
+        
+        # Add the additional 3x3 conv
+        enc_layers.append(nn.Conv2d(hdim, hdim, 3, stride = 1, padding = 1))
+        dec_layers.insert(0, nn.Conv2d(codebook_dim, hdim, 3, stride = 1, padding = 1))
 
-        for _ in range(num_resnet_blocks):
-            dec_layers.insert(0, ResBlock(dec_chans[1]))
-            enc_layers.append(ResBlock(enc_chans[-1]))
+        dec_layers.insert(1, nn.ReLU())
 
-        if num_resnet_blocks > 0:
-            dec_layers.insert(0, nn.Conv2d(codebook_dim, dec_chans[1], 1))
+        # Add ResBlocks
+        for _ in range(num_res_blocks):
+            dec_layers.insert(1, ResBlock(hdim))
+            enc_layers.append(ResBlock(hdim))
 
-        enc_layers.append(nn.Conv2d(enc_chans[-1], num_tokens, 1))
-        dec_layers.append(nn.Conv2d(dec_chans[-1], channels, 1))
+        # Add the ReLU output ResBlocks
+        enc_layers.append(nn.ReLU())
+
+        # Transfer hidden (i.e., z) to logits
+        self.code_logit_conv1x1 = nn.Conv2d(hdim, num_tokens, 1)
 
         self.encoder = nn.Sequential(*enc_layers)
         self.decoder = nn.Sequential(*dec_layers)
 
     @torch.no_grad()
-    def get_codebook_indices(self, images):
-        logits = self.forward(images, return_logits = True)
+    def get_codebook_indices(self, img):
+        z = self.encoder(img)
+        logits = self.code_logit_conv1x1(z)
         codebook_indices = logits.argmax(dim = 1).flatten(1)
         return codebook_indices
 
@@ -137,26 +148,15 @@ class DiscreteVAE(nn.Module):
         images = self.decoder(image_embeds)
         return images
 
-    def forward(
-        self,
-        img,
-        return_recon_loss = False,
-        return_logits = False
-    ):
-        logits = self.encoder(img)
-
-        if return_logits:
-            return logits # return logits for getting hard image indices for DALL-E training
+    def forward(self, img):
+        z = self.encoder(img)
+        logits = self.code_logit_conv1x1(z)
 
         soft_one_hot = F.gumbel_softmax(logits, tau = self.temperature, dim = 1, hard = self.straight_through)
         sampled = einsum('b n h w, n d -> b d h w', soft_one_hot, self.codebook.weight)
         out = self.decoder(sampled)
 
-        if not return_recon_loss:
-            return out
-
-        loss = F.mse_loss(img, out)
-        return loss
+        return out
 
 # main classes
 
